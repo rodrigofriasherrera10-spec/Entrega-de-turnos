@@ -1,0 +1,45 @@
+/* EFE Turnos — Socket, constantes, reloj, estado servidor */
+const SECS=['Limache','Belloto','Puerto'];
+const SEC_COL={Limache:'#22C55E',Belloto:'#38BDF8',Puerto:'#F87171'};
+const TIPOS=['MC', 'TCP', 'C1', 'C2', 'M1', 'R', 'M2'];
+const MESES=['Enero','Febrero','Marzo','Abril','Mayo','Junio','Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre'];
+const DIAS=['Dom','Lun','Mar','Mié','Jue','Vie','Sáb'];
+
+let turnos=[],liveData={};
+let fallas={Limache:[],Belloto:[],Puerto:[]};
+let fC={Limache:0,Belloto:0,Puerto:0};
+let activeSec='Limache', tipoCierre='parcial';
+let dateFilter=null,calYear,calMonth,autoTimer=null;
+const NOW=new Date();
+
+// ── SOCKET ───────────────────────────────────
+const socket=io();
+socket.on('connect',()=>{{setSyncOk();cargarNovLog();}});
+socket.on('disconnect',()=>setSyncErr());
+socket.on('sync_turnos',d=>{turnos=d;renderHist();renderCal();});
+socket.on('live_update',d=>{liveData=d;renderLiveGrid();});
+socket.on('turno_cerrado',t=>{
+  turnos.unshift(t);
+  renderHist();
+  renderCal();
+  showToast('📋 Cierre registrado correctamente','success');
+  // Switch to historial to see it
+  const histTab = document.getElementById('tab-historial');
+  if(histTab && !histTab.classList.contains('active')) {
+    setTimeout(()=>reloadHist(), 500);
+  }
+});
+
+function setSyncOk(){document.getElementById('syncEl').className='sync';document.getElementById('syncTxt').textContent='Sincronizado';}
+function setSyncSaving(){document.getElementById('syncEl').className='sync saving';document.getElementById('syncTxt').textContent='Guardando…';}
+function setSyncErr(){document.getElementById('syncEl').className='sync err';document.getElementById('syncTxt').textContent='Sin conexión';}
+
+function tick(){const n=new Date();document.getElementById('clockEl').textContent=n.toLocaleDateString('es-CL',{day:'2-digit',month:'2-digit',year:'numeric'})+' '+n.toLocaleTimeString('es-CL',{hour:'2-digit',minute:'2-digit'});}
+tick();setInterval(tick,30000);
+
+fetch('/api/status').then(r=>r.json()).then(d=>{
+  const el=document.getElementById('serverInfo');
+  if(el) el.innerHTML=`IP: ${d.ip}<br>Registros: ${d.total}`;
+}).catch(()=>{});
+
+// ── TABS ─────────────────────────────────────
