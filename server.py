@@ -1,613 +1,575 @@
-/* EFE Turnos — Features: severidad, adjuntos, badge tabs, filtro, subir fotos */
-function showToast(msg,type='success'){
-  const t=document.getElementById('toast');t.textContent=msg;t.className=`show ${type}`;
-  clearTimeout(t._t);t._t=setTimeout(()=>t.className='',3500);
-}
+"""
+EFE Metro Valparaíso — Sistema de Entrega de Turnos v4
+Flujo colaborativo: cada sector escribe desde su PC en tiempo real
+Cierre parcial (por turno) y cierre total del día
+"""
+from flask import Flask, jsonify, request, send_file, abort
+from flask_socketio import SocketIO, emit
+import json, os, io, time, socket as socket_lib, smtplib
+from datetime import datetime
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email.mime.text import MIMEText
+from email import encoders
 
-// INIT
-document.getElementById('f-fecha').value=NOW.toISOString().split('T')[0];
-document.getElementById('f-hora').value=NOW.toTimeString().slice(0,5);
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.units import cm
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table,
+                                 TableStyle, HRFlowable, Image as RLImage)
+from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
 
-// ── NOVEDADES LOG ─────────────────────────────
-function toggleNovLog() {
-  const panel = document.getElementById('novLogPanel');
-  const arrow = document.getElementById('novLogArrow');
-  if (!panel) return;
-  const open = panel.style.display !== 'none';
-  panel.style.display = open ? 'none' : 'block';
-  arrow.textContent = open ? '▼' : '▲';
-}
+BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
+LOGO_FILE = os.path.join(BASE_DIR, "static_logo.png")
 
-function renderNovLog(lista) {
-  const el  = document.getElementById('novLogList');
-  const cnt = document.getElementById('novLogCount');
-  if (!el) return;
-  if (cnt) cnt.textContent = lista.length;
-  if (!lista.length) {
-    el.innerHTML = '<div style="text-align:center;padding:20px;color:var(--muted2);font-size:12px;font-style:italic;">Sin novedades aún</div>';
-    return;
-  }
-  const secColor = {Limache:'#22C55E', Belloto:'#38BDF8', Puerto:'#F87171'};
-  el.innerHTML = lista.map((n,i) => {
-    const sc = secColor[n.sector] || 'var(--cyan)';
-    const sb = n.sector
-      ? `<span style="font-size:10px;background:${sc}22;color:${sc};padding:2px 8px;border-radius:10px;font-family:'IBM Plex Mono',monospace;font-weight:600;">${n.sector}</span>`
-      : '';
-    return `<div style="background:var(--bg3);border:1px solid var(--border2);border-radius:7px;padding:9px 12px;" data-idx="${i}">
-      <div style="display:flex;align-items:center;gap:6px;margin-bottom:5px;flex-wrap:wrap;">
-        <span style="font-size:11px;font-weight:600;color:var(--cyan);">${n.autor||'—'}</span>
-        ${sb}
-        <span style="font-size:10px;color:var(--muted2);font-family:'IBM Plex Mono',monospace;margin-left:auto;">${n.hora||''}</span>
-        <button onclick="eliminarNovedad(this)" style="background:none;border:none;cursor:pointer;color:var(--muted2);font-size:14px;line-height:1;padding:0 3px;" title="Eliminar" onmouseover="this.style.color='#EF4444'" onmouseout="this.style.color='var(--muted2)'">✕</button>
-      </div>
-      <div style="font-size:13px;color:var(--text);line-height:1.5;white-space:pre-wrap;">${n.texto||''}</div>
-    </div>`;
-  }).join('');
-}
+# Usar /data si existe (Railway Volume), si no usar directorio local
+DATA_DIR  = "/data" if os.path.isdir("/data") else BASE_DIR
+DATA_FILE = os.path.join(DATA_DIR, "turnos_data.json")
+LIVE_FILE = os.path.join(DATA_DIR, "turno_activo.json")
 
-async function cargarNovLog() {
-  try {
-    const r = await fetch('/api/novedades_log');
-    const data = await r.json();
-    renderNovLog(data);
-  } catch(e) {}
-  await cargarTodosLogs();
-}
+SMTP_HOST   = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT   = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER   = os.environ.get("SMTP_USER", "")
+SMTP_PASS   = os.environ.get("SMTP_PASS", "")
+CORREO_DEST = "ilinea@metrovalparaiso.cl"
+PORT        = int(os.environ.get("PORT", "5000"))
 
-async 
-function agregarNovLogLocal(entrada) {
-  const el  = document.getElementById('novLogList');
-  const cnt = document.getElementById('novLogCount');
-  if (!el) return;
-  const ph = el.querySelector('[style*="font-style:italic"]');
-  if (ph) el.innerHTML = '';
-  const div = document.createElement('div');
-  div.style.cssText = 'background:var(--bg3);border:1px solid var(--border2);border-radius:7px;padding:9px 12px;';
-  div.dataset.id = entrada.id || Date.now();
-  const secColor = {Limache:'#22C55E', Belloto:'#38BDF8', Puerto:'#F87171'};
-  const sc = secColor[entrada.sector] || 'var(--cyan)';
-  const sb = entrada.sector
-    ? `<span style="font-size:10px;background:${sc}22;color:${sc};padding:2px 8px;border-radius:10px;font-family:'IBM Plex Mono',monospace;font-weight:600;border:1px solid ${sc}44;">${entrada.sector}</span>`
-    : '';
-  div.innerHTML = `
-    <div style="display:flex;align-items:center;gap:6px;margin-bottom:5px;flex-wrap:wrap;">
-      <span style="font-size:11px;font-weight:600;color:var(--cyan);">${entrada.autor||'—'}</span>
-      ${sb}
-      <span style="font-size:10px;color:var(--muted2);font-family:'IBM Plex Mono',monospace;margin-left:auto;">${entrada.hora||''}</span>
-      <button onclick="eliminarNovedad(this)" style="background:none;border:none;cursor:pointer;color:var(--muted2);font-size:14px;line-height:1;padding:0 3px;" title="Eliminar" onmouseover="this.style.color='#EF4444'" onmouseout="this.style.color='var(--muted2)'">✕</button>
-    </div>
-    <div style="font-size:13px;color:var(--text);line-height:1.5;white-space:pre-wrap;">${entrada.texto||''}</div>`;
-  el.insertBefore(div, el.firstChild);
-  if (cnt) cnt.textContent = el.children.length;
-}
+EFE_AZUL  = colors.HexColor("#0B2D6B")
+EFE_ROJO  = colors.HexColor("#C8102E")
+EFE_GRIS  = colors.HexColor("#F2F5F9")
+EFE_GRIS2 = colors.HexColor("#DCE3EC")
+EFE_NEGRO = colors.HexColor("#1A1A2E")
+EFE_MUTED = colors.HexColor("#5A6A82")
+WHITE     = colors.white
+SEC_COL   = {"Limache": colors.HexColor("#1D9E75"),
+             "Belloto": colors.HexColor("#0B5EA8"),
+             "Puerto":  colors.HexColor("#C8102E")}
+SECTORES  = ["Limache","Belloto","Puerto"]
 
-function _publicarNovedad_base() {
-  const input  = document.getElementById('f-novedad-input');
-  const txt    = (input?.value || '').trim();
-  const autor  = document.getElementById('f-entrega')?.value?.trim() || 'Sin nombre';
-  const sector = document.getElementById('f-sector')?.value?.trim() || activeSec || '';
-  if (!txt) { showToast('Escribe una novedad primero', 'error'); return; }
-  if (input) input.value = '';
-  const entrada = {
-    texto: txt, autor: autor, sector: sector,
-    hora: new Date().toLocaleTimeString('es-CL',{hour:'2-digit',minute:'2-digit'}),
-    id: Date.now()
-  };
-  agregarNovLogLocal(entrada);
-  const panel = document.getElementById('novLogPanel');
-  const arrow = document.getElementById('novLogArrow');
-  if (panel) panel.style.display = 'block';
-  if (arrow) arrow.textContent = '▲';
-  showToast('📢 Novedad publicada', 'success');
-  fetch('/api/novedad', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({texto: txt, autor: autor, sector: sector})
-  }).catch(() => {});
-}
+app = Flask(__name__, 
+    template_folder=os.path.join(BASE_DIR, "templates"),
+    static_folder=os.path.join(BASE_DIR, "static"))
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY","efe_v4_2024")
+socketio = SocketIO(app, cors_allowed_origins="*")
 
-async function refreshTodo() {
-  const borrarLogs = confirm('¿Limpiar TODO incluido el historial del día?\n\nOK = borra todo (Reset completo)\nCancelar = solo limpia el formulario');
-  if (borrarLogs === null) return; // cerró el diálogo
+# ── Persistencia ─────────────────────────────
+_cache_turnos = None
+_cache_live   = None
 
-  ['f-turno','f-entrega','f-recibe'].forEach(id => { const e = document.getElementById(id); if(e) e.value = ''; });
-  const fd = document.getElementById('f-fecha');
-  const fh = document.getElementById('f-hora');
-  if (fd) fd.value = NOW.toISOString().split('T')[0];
-  if (fh) fh.value = NOW.toTimeString().slice(0,5);
-  const ni = document.getElementById('f-novedad-input');
-  if (ni) ni.value = '';
-  SECS.forEach(s => {
-    fallas[s] = []; fC[s] = 0;
-    const fc = document.getElementById('fallas-'+s);
-    if (fc) fc.innerHTML = '';
-    updateBadge(s);
-    [s+'-infra', s+'-ops', s+'-pend'].forEach(id => { const e = document.getElementById(id); if(e) e.value = ''; });
-  });
-  try {
-    await fetch('/api/live/limpiar', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({borrar_logs: borrarLogs})
-    });
-  } catch(e) {}
-  if (borrarLogs) {
-    // limpiar listas en pantalla
-    ['Limache','Belloto','Puerto'].forEach(s => {
-      ['infra','ops','pend'].forEach(t => {
-        const el = document.getElementById(`obs-log-list-${s}-${t}`);
-        if (el) el.innerHTML = '<div style="text-align:center;padding:10px;color:var(--muted2);font-size:11px;font-style:italic;">Sin registros</div>';
-        const cnt = document.getElementById(`cnt-${s}-${t}`);
-        if (cnt) cnt.textContent = '0';
-      });
-      const fl = document.getElementById(`fallas-log-list-${s}`);
-      if (fl) fl.innerHTML = '<div style="text-align:center;padding:12px;color:var(--muted2);font-size:11px;font-style:italic;">Sin fallas registradas</div>';
-      const fc = document.getElementById(`cnt-fallas-${s}`);
-      if (fc) fc.textContent = '0';
-    });
-    // limpiar novedades
-    const nl = document.getElementById('novLogList');
-    if (nl) nl.innerHTML = '<div style="text-align:center;padding:20px;color:var(--muted2);font-size:12px;font-style:italic;">Sin novedades aún</div>';
-    const nc = document.getElementById('novLogCount');
-    if (nc) nc.textContent = '0';
-    showToast('🔄 Reset completo — todo borrado', 'warning');
-  } else {
-    showToast('🔄 Formulario limpiado — historial conservado', 'success');
-  }
-}
+def load_turnos():
+    global _cache_turnos
+    try:
+        if os.path.exists(DATA_FILE):
+            with open(DATA_FILE,"r",encoding="utf-8") as f:
+                _cache_turnos = json.load(f)
+                return _cache_turnos
+    except: pass
+    if _cache_turnos is None: _cache_turnos = []
+    return _cache_turnos
 
-// Socket listener para novedades en tiempo real
-socket.on('novedad_nueva', entrada => {
-  if (!entrada) return;
-  if (document.querySelector(`[data-id="${entrada.id}"]`)) return;
-  agregarNovLogLocal(entrada);
-  const sc = {Limache:'Limache',Belloto:'Belloto',Puerto:'Puerto'}[entrada.sector]||'';
-  showToast('📢 ' + (sc?'['+sc+'] ':'') + (entrada.autor||''), 'info');
-});
+def save_turnos(data):
+    global _cache_turnos
+    _cache_turnos = data
+    try:
+        with open(DATA_FILE,"w",encoding="utf-8") as f:
+            json.dump(data,f,ensure_ascii=False,indent=2)
+    except Exception as e: print(f"Warning save_turnos: {e}")
 
-// Cargar novedades al conectar
-socket.on('connect', () => { setSyncOk(); cargarNovLog(); });
+def load_live():
+    global _cache_live
+    try:
+        if os.path.exists(LIVE_FILE):
+            with open(LIVE_FILE,"r",encoding="utf-8") as f:
+                _cache_live = json.load(f)
+                return _cache_live
+    except: pass
+    if _cache_live is None: _cache_live = {}
+    return _cache_live
+
+def save_live(data):
+    global _cache_live
+    _cache_live = data
+    try:
+        with open(LIVE_FILE,"w",encoding="utf-8") as f:
+            json.dump(data,f,ensure_ascii=False,indent=2)
+    except Exception as e: print(f"Warning save_live: {e}")
+
+# ── API TURNO ACTIVO (colaborativo en tiempo real) ──
+@app.route("/api/live", methods=["GET"])
+def get_live():
+    return jsonify(load_live())
 
 
-// ── OBS & FALLAS LOG ────────────────────────
-function toggleLog(panelId) {
-  const panel = document.getElementById(panelId);
-  if (!panel) return;
-  const arrId = panelId.replace('obs-log-','arr-').replace('fallas-log-','arr-fallas-');
-  const arrow = document.getElementById(arrId);
-  const open  = panel.style.display !== 'none';
-  panel.style.display = open ? 'none' : 'block';
-  if (arrow) arrow.textContent = open ? '▼' : '▲';
-}
 
-function addLogEntry(listId, cntId, entrada) {
-  const el  = document.getElementById(listId);
-  const cnt = document.getElementById(cntId);
-  if (!el) return;
-  const ph = el.querySelector('[style*="font-style:italic"]');
-  if (ph) el.innerHTML = '';
-  const div = document.createElement('div');
-  div.style.cssText = 'background:var(--bg3);border:1px solid var(--border2);border-radius:6px;padding:8px 10px;position:relative;';
-  div.dataset.id = entrada.id || Date.now();
-  div.innerHTML = `
-    <div style="display:flex;gap:8px;margin-bottom:3px;align-items:center;">
-      <span style="font-size:11px;font-weight:600;color:var(--cyan);">${entrada.autor||'—'}</span>
-      <span style="font-size:10px;color:var(--muted2);font-family:'IBM Plex Mono',monospace;">${entrada.hora||''}</span>
-      <button onclick="eliminarEntradaLog(this)" style="margin-left:auto;background:none;border:none;cursor:pointer;color:var(--muted2);font-size:14px;line-height:1;padding:0 3px;border-radius:4px;transition:color .15s;" title="Eliminar esta entrada" onmouseover="this.style.color='#EF4444'" onmouseout="this.style.color='var(--muted2)'">✕</button>
-    </div>
-    <div style="font-size:12px;color:var(--text);line-height:1.5;white-space:pre-wrap;">${entrada.texto||''}</div>`;
-  el.insertBefore(div, el.firstChild);
-  if (cnt) cnt.textContent = el.children.length;
-}
 
-function eliminarEntradaLog(btn) {
-  const item = btn.closest('[data-id]');
-  const list = item?.parentElement;
-  const cntEl = list?.parentElement?.parentElement?.querySelector('[id^="cnt-"]');
-  if (!item) return;
-  item.remove();
-  if (cntEl) {
-    const remaining = list.querySelectorAll('[data-id]').length;
-    cntEl.textContent = remaining;
-    if (remaining === 0) {
-      list.innerHTML = '<div style="text-align:center;padding:10px;color:var(--muted2);font-size:11px;font-style:italic;">Sin registros</div>';
+
+@app.route("/api/novedades_log", methods=["GET"])
+def get_novedades_log():
+    log = load_live().get("novedades_log", [])
+    return jsonify(log)
+
+@app.route("/api/novedad", methods=["POST"])
+def post_novedad():
+    d = request.get_json()
+    txt = d.get("texto","").strip()
+    autor = d.get("autor","").strip() or "Sin nombre"
+    if not txt:
+        return jsonify({"ok": False, "msg": "Novedad vacía"})
+    live = load_live() or {}
+    if not live.get("id"):
+        live["id"] = int(time.time()*1000)
+    if "novedades_log" not in live:
+        live["novedades_log"] = []
+    sector   = d.get("sector","").strip()
+    severidad = d.get("severidad","info")
+    adjuntos  = d.get("adjuntos",[])
+    entrada = {
+        "id":        int(time.time()*1000),
+        "texto":     txt,
+        "autor":     autor,
+        "sector":    sector,
+        "severidad": severidad,
+        "adjuntos":  adjuntos,
+        "hora":      datetime.now().strftime("%H:%M"),
+        "fecha":     datetime.now().strftime("%d/%m/%Y"),
     }
-  }
-}
+    live["novedades_log"].insert(0, entrada)
+    save_live(live)
+    socketio.emit("novedad_nueva", entrada)
+    socketio.emit("live_update", live)
+    return jsonify({"ok": True, "entrada": entrada})
 
-const _lastPub = {};
-function publicarObs(sec, tipo) {
-  const key = sec + '-' + tipo;
-  const now = Date.now();
-  if (_lastPub[key] && now - _lastPub[key] < 2000) return;
-  _lastPub[key] = now;
-  const input = document.getElementById(key);
-  const txt   = (input ? input.value : '').trim();
-  const autor = (document.getElementById('f-entrega') ? document.getElementById('f-entrega').value : '').trim() || 'Sin nombre';
-  if (!txt) { showToast('Escribe algo primero', 'error'); return; }
-  const entrada = {
-    texto: txt, autor: autor, sector: sec,
-    hora: new Date().toLocaleTimeString('es-CL',{hour:'2-digit',minute:'2-digit'}),
-    id: Date.now()
-  };
-  addLogEntry('obs-log-list-' + sec + '-' + tipo, 'cnt-' + sec + '-' + tipo, entrada);
-  const panel = document.getElementById('obs-log-' + sec + '-' + tipo);
-  const arrow = document.getElementById('arr-' + sec + '-' + tipo);
-  if (panel) panel.style.display = 'block';
-  if (arrow) arrow.textContent = '▲';
-  showToast('📢 ' + sec + ' — publicado', 'success');
-  fetch('/api/obs_log', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({sector: sec, tipo: tipo, texto: txt, autor: autor})
-  }).catch(function() {});
-}
+@app.route("/api/live/update", methods=["POST"])
+def update_live():
+    d = request.get_json()
+    live = load_live() or {}
+    # Merge incoming data into live state
+    for key in ["turno","fecha","hora","entrega","recibe","sector","clima","novedades"]:
+        if key in d: live[key] = d[key]
+    if "sectores" in d:
+        if "sectores" not in live: live["sectores"] = {}
+        for sec, val in d["sectores"].items():
+            live["sectores"][sec] = val
+    if not live.get("id"): live["id"] = int(time.time()*1000)
+    save_live(live)
+    socketio.emit("live_update", live)
+    return jsonify({"ok": True})
 
-const _lastFalla = {};
-function publicarFalla(sec) {
-  const now = Date.now();
-  if (_lastFalla[sec] && now - _lastFalla[sec] < 2000) return;
-  _lastFalla[sec] = now;
-  const entradaEl = document.getElementById('f-entrega');
-  const autor = (entradaEl ? entradaEl.value : '').trim() || 'Sin nombre';
-  const fl = getFallas(sec);
-  if (!fl.length) { showToast('Agrega al menos una falla primero', 'error'); return; }
-  const entrada = {
-    fallas: fl, autor: autor, sector: sec,
-    hora: new Date().toLocaleTimeString('es-CL',{hour:'2-digit',minute:'2-digit'}),
-    id: Date.now()
-  };
-  renderFallaLogEntry(sec, entrada);
-  const panel = document.getElementById('fallas-log-' + sec);
-  const arrow = document.getElementById('arr-fallas-' + sec);
-  if (panel) panel.style.display = 'block';
-  if (arrow) arrow.textContent = '▲';
-  showToast('🚨 Falla registrada — ' + sec, 'success');
-  fetch('/api/falla_log', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({sector: sec, fallas: fl, autor: autor})
-  }).catch(function() {});
-}
-
-async function cargarTodosLogs() {
-  try {
-    const r = await fetch('/api/logs_dia');
-    const d = await r.json();
-    // obs logs
-    if (d.obs_log) {
-      d.obs_log.forEach(e => {
-        addLogEntry(`obs-log-list-${e.sector}-${e.tipo}`, `cnt-${e.sector}-${e.tipo}`, e);
-      });
+@app.route("/api/live/iniciar", methods=["POST"])
+def iniciar_turno():
+    d = request.get_json()
+    live = {
+        "id":         int(time.time()*1000),
+        "fecha":      d.get("fecha",""),
+        "turno":      d.get("turno",""),
+        "iniciado":   datetime.now().isoformat(),
+        "estado":     "activo",
+        "sectores": {
+            "Limache": {"inspector":"","trenesFalla":[],"infra":"","ops":"","pend":"","cerrado":False},
+            "Belloto": {"inspector":"","trenesFalla":[],"infra":"","ops":"","pend":"","cerrado":False},
+            "Puerto":  {"inspector":"","trenesFalla":[],"infra":"","ops":"","pend":"","cerrado":False},
+        },
+        "novedades":  "",
+        "responsable": d.get("responsable",""),
     }
-    // fallas log
-    if (d.fallas_log) {
-      d.fallas_log.forEach(e => {
-        renderFallaLogEntry(e.sector, e);
-      });
+    save_live(live)
+    socketio.emit("live_update", live)
+    return jsonify({"ok":True,"live":live})
+
+@app.route("/api/live/sector", methods=["POST"])
+def update_sector():
+    d = request.get_json()
+    live = load_live()
+    if not live: return jsonify({"ok":False,"msg":"No hay turno activo"}),400
+    sec = d.get("sector")
+    if sec not in SECTORES: return jsonify({"ok":False,"msg":"Sector inválido"}),400
+    live["sectores"][sec]["inspector"]   = d.get("inspector","")
+    live["sectores"][sec]["trenesFalla"] = d.get("trenesFalla",[])
+    live["sectores"][sec]["infra"]       = d.get("infra","")
+    live["sectores"][sec]["ops"]         = d.get("ops","")
+    live["sectores"][sec]["pend"]        = d.get("pend","")
+    live["novedades"] = d.get("novedades", live.get("novedades",""))
+    save_live(live)
+    socketio.emit("live_update", live)
+    return jsonify({"ok":True})
+
+@app.route("/api/live/cerrar", methods=["POST"])
+def cerrar_turno():
+    d = request.get_json()
+    tipo = d.get("tipo","parcial")  # "parcial" o "total"
+    quien = d.get("quien","")
+    live = load_live()
+    if not live: return jsonify({"ok":False,"msg":"No hay turno activo"}),400
+
+    registro = {
+        "id":            int(time.time()*1000),
+        "timestamp":     datetime.now().isoformat(),
+        "tipo_cierre":   tipo,
+        "cerrado_por":   quien,
+        "hora_cierre":   datetime.now().strftime("%H:%M"),
+        "fecha":         d.get("fecha","") or live.get("fecha",""),
+        "turno":         d.get("turno","") or live.get("turno",""),
+        "sector":        d.get("sector","") or live.get("sector",""),
+        "clima":         d.get("clima","") or live.get("clima",""),
+        "entrega":       d.get("entrega","") or live.get("entrega",""),
+        "recibe":        d.get("recibe","") or live.get("recibe",""),
+        "novedades":     d.get("novedades","") or live.get("novedades",""),
+        "novedades_log": live.get("novedades_log",[]),
+        "sectores":      live.get("sectores",{}),
     }
-  } catch(e) {}
-}
 
-function renderFallaLogEntry(sec, entrada) {
-  const el  = document.getElementById(`fallas-log-list-${sec}`);
-  const cnt = document.getElementById(`cnt-fallas-${sec}`);
-  if (!el) return;
-  const ph = el.querySelector('[style*="font-style:italic"]');
-  if (ph) el.innerHTML = '';
-  const div = document.createElement('div');
-  div.style.cssText = 'background:rgba(239,68,68,.07);border:1px solid rgba(239,68,68,.3);border-radius:6px;padding:8px 10px;position:relative;';
-  div.dataset.id = entrada.id || Date.now();
-  const fallasHtml = (entrada.fallas||[]).map(f =>
-    `<div style="font-size:12px;color:#F87171;font-family:'IBM Plex Mono',monospace;">🚨 ${f.tid||'?'} | ${f.tipo||'?'} | Andén: ${f.anden||'?'}</div>
-     ${f.obs?`<div style="font-size:11px;color:var(--text);padding-left:14px;">${f.obs}</div>`:''}`
-  ).join('');
-  div.innerHTML = `
-    <div style="display:flex;gap:8px;margin-bottom:4px;align-items:center;">
-      <span style="font-size:11px;font-weight:600;color:#F87171;">${entrada.autor||'—'}</span>
-      <span style="font-size:10px;color:var(--muted2);font-family:'IBM Plex Mono',monospace;">${entrada.hora||''}</span>
-      <button onclick="eliminarEntradaLog(this)" style="margin-left:auto;background:none;border:none;cursor:pointer;color:var(--muted2);font-size:14px;line-height:1;padding:0 3px;border-radius:4px;transition:color .15s;" title="Eliminar esta entrada" onmouseover="this.style.color='#EF4444'" onmouseout="this.style.color='var(--muted2)'">✕</button>
-    </div>
-    ${fallasHtml}`;
-  el.insertBefore(div, el.firstChild);
-  if (cnt) cnt.textContent = el.children.length;
-}
+    turnos = load_turnos()
+    turnos.insert(0, registro)
+    save_turnos(turnos)
 
-// Socket listeners para obs y fallas en tiempo real
-socket.on('obs_nueva', e => {
-  addLogEntry(`obs-log-list-${e.sector}-${e.tipo}`, `cnt-${e.sector}-${e.tipo}`, e);
-  const panelId = `obs-log-${e.sector}-${e.tipo}`;
-  const panel   = document.getElementById(panelId);
-  if (panel) panel.style.display = 'block';
-  const arr = document.getElementById(`arr-${e.sector}-${e.tipo}`);
-  if (arr) arr.textContent = '▲';
-  showToast(`📢 ${e.sector}: nueva observación de ${e.autor||'alguien'}`, 'info');
-});
+    if tipo == "total":
+        save_live({})
+        socketio.emit("live_update", {})
+    else:
+        live["estado"] = "activo"
+        save_live(live)
+        socketio.emit("live_update", live)
 
-socket.on('falla_nueva', e => {
-  renderFallaLogEntry(e.sector, e);
-  const panel = document.getElementById(`fallas-log-${e.sector}`);
-  if (panel) panel.style.display = 'block';
-  const arr = document.getElementById(`arr-fallas-${e.sector}`);
-  if (arr) arr.textContent = '▲';
-  showToast(`🚨 ${e.sector}: nueva falla de ${e.autor||'alguien'}`, 'warning');
-});
+    socketio.emit("turno_cerrado", registro)
+    return jsonify({"ok":True,"id":registro["id"]})
+
+@app.route("/api/live/cancelar", methods=["POST"])
+def cancelar_live():
+    save_live({})
+    socketio.emit("live_update", {})
+    return jsonify({"ok":True})
+
+# ── API HISTORIAL ────────────────────────────
+
+@app.route("/api/live/limpiar", methods=["POST"])
+def limpiar_live():
+    d = request.get_json() or {}
+    borrar_logs = d.get("borrar_logs", False)
+    live = load_live() or {}
+    if borrar_logs:
+        nueva_live = {}
+    else:
+        # Conserva todos los logs
+        nueva_live = {
+            "novedades_log": live.get("novedades_log", []),
+            "obs_log":       live.get("obs_log", []),
+            "fallas_log":    live.get("fallas_log", []),
+        }
+    save_live(nueva_live)
+    socketio.emit("live_update", nueva_live)
+    return jsonify({"ok": True})
 
 
-function eliminarNovedad(btn) {
-  const item = btn.closest('div[style]');
-  const list = document.getElementById('novLogList');
-  const cnt  = document.getElementById('novLogCount');
-  if (!item || !list) return;
-  item.remove();
-  const remaining = list.querySelectorAll('div[style]').length;
-  if (cnt) cnt.textContent = remaining;
-  if (remaining === 0) {
-    list.innerHTML = '<div style="text-align:center;padding:20px;color:var(--muted2);font-size:12px;font-style:italic;">Sin novedades aún</div>';
-  }
-}
+@app.route("/api/obs_log", methods=["POST"])
+def post_obs_log():
+    d = request.get_json()
+    sec   = d.get("sector","")
+    tipo  = d.get("tipo","")
+    txt   = d.get("texto","").strip()
+    autor = d.get("autor","Sin nombre")
+    if not txt or sec not in ["Limache","Belloto","Puerto"]:
+        return jsonify({"ok": False, "msg": "Datos inválidos"})
+    live = load_live() or {}
+    if not live.get("id"): live["id"] = int(time.time()*1000)
+    if "obs_log" not in live: live["obs_log"] = []
+    entrada = {
+        "id": int(time.time()*1000),
+        "sector": sec, "tipo": tipo,
+        "texto": txt, "autor": autor,
+        "hora": datetime.now().strftime("%H:%M"),
+        "fecha": datetime.now().strftime("%d/%m/%Y"),
+    }
+    live["obs_log"].insert(0, entrada)
+    save_live(live)
+    socketio.emit("obs_nueva", entrada)
+    return jsonify({"ok": True})
 
-// ── TEMA ─────────────────────────────────────
-const THEME_ICONS = {dark:'🌙', light:'☀️', system:'💻'};
+@app.route("/api/falla_log", methods=["POST"])
+def post_falla_log():
+    d = request.get_json()
+    sec    = d.get("sector","")
+    fallas = d.get("fallas",[])
+    autor  = d.get("autor","Sin nombre")
+    if not fallas or sec not in ["Limache","Belloto","Puerto"]:
+        return jsonify({"ok": False, "msg": "Datos inválidos"})
+    live = load_live() or {}
+    if not live.get("id"): live["id"] = int(time.time()*1000)
+    if "fallas_log" not in live: live["fallas_log"] = []
+    entrada = {
+        "id": int(time.time()*1000),
+        "sector": sec, "fallas": fallas,
+        "autor": autor,
+        "hora": datetime.now().strftime("%H:%M"),
+        "fecha": datetime.now().strftime("%d/%m/%Y"),
+    }
+    live["fallas_log"].insert(0, entrada)
+    save_live(live)
+    socketio.emit("falla_nueva", entrada)
+    return jsonify({"ok": True})
 
-function setTheme(theme) {
-  document.documentElement.setAttribute('data-theme', theme);
-  localStorage.setItem('efe-theme', theme);
-  const btn = document.getElementById('themeBtn');
-  if (btn) btn.textContent = THEME_ICONS[theme];
-  // update active state
-  ['dark','light','system'].forEach(t => {
-    const el = document.getElementById('topt-' + t);
-    if (el) el.classList.toggle('active', t === theme);
-  });
-  closeThemeMenu();
-}
-
-function toggleThemeMenu() {
-  const m = document.getElementById('themeMenu');
-  if (!m) return;
-  m.style.display = m.style.display === 'none' ? 'block' : 'none';
-}
-
-function closeThemeMenu() {
-  const m = document.getElementById('themeMenu');
-  if (m) m.style.display = 'none';
-}
-
-// Cerrar al clic fuera
-document.addEventListener('click', e => {
-  if (!e.target.closest('#themeBtn') && !e.target.closest('#themeMenu')) {
-    closeThemeMenu();
-  }
-});
-
-// Cargar tema guardado
-(function initTheme() {
-  const saved = localStorage.getItem('efe-theme') || 'dark';
-  document.documentElement.setAttribute('data-theme', saved);
-  const btn = document.getElementById('themeBtn');
-  if (btn) btn.textContent = THEME_ICONS[saved];
-  ['dark','light','system'].forEach(t => {
-    const el = document.getElementById('topt-' + t);
-    if (el) el.classList.toggle('active', t === saved);
-  });
-})();
+@app.route("/api/logs_dia", methods=["GET"])
+def get_logs_dia():
+    live = load_live() or {}
+    return jsonify({
+        "obs_log":    live.get("obs_log", []),
+        "fallas_log": live.get("fallas_log", []),
+    })
 
 
-function buildNovLog(log) {
-  if (!log || !log.length) return '';
-  const secColor = {Limache:'#22C55E', Belloto:'#38BDF8', Puerto:'#F87171'};
-  const items = log.map(n => {
-    const sc = secColor[n.sector] || 'var(--cyan)';
-    const sb = n.sector ? `<span style="font-size:10px;background:${sc}22;color:${sc};padding:1px 7px;border-radius:10px;font-family:'IBM Plex Mono',monospace;">${n.sector}</span>` : '';
-    return `<div style="background:var(--bg3);border:1px solid var(--border2);border-radius:6px;padding:8px 10px;">
-      <div style="display:flex;align-items:center;gap:6px;margin-bottom:3px;flex-wrap:wrap;">
-        <span style="font-size:11px;font-weight:600;color:var(--cyan);">${n.autor||'—'}</span>
-        ${sb}
-        <span style="font-size:10px;color:var(--muted2);font-family:'IBM Plex Mono',monospace;margin-left:auto;">${n.hora||''}</span>
-      </div>
-      <div style="font-size:12px;color:var(--text);line-height:1.4;white-space:pre-wrap;">${n.texto||''}</div>
-    </div>`;
-  }).join('');
-  return `<div style="margin-bottom:12px;">
-    <div style="font-size:10px;font-weight:600;color:var(--muted2);letter-spacing:.08em;text-transform:uppercase;font-family:'IBM Plex Mono',monospace;margin-bottom:6px;">📋 Novedades del día (${log.length})</div>
-    <div style="display:flex;flex-direction:column;gap:5px;">${items}</div>
-  </div>`;
-}
+@app.route("/api/upload", methods=["POST"])
+def upload_file():
+    if 'file' not in request.files:
+        return jsonify({"ok": False, "msg": "No file"})
+    file = request.files['file']
+    context = request.form.get('context','general')
+    if not file.filename:
+        return jsonify({"ok": False, "msg": "Empty filename"})
+    import re, uuid
+    # Sanitize filename
+    ext = os.path.splitext(file.filename)[1].lower()
+    safe_name = re.sub(r'[^a-zA-Z0-9_-]','_', os.path.splitext(file.filename)[0])
+    filename = f"{safe_name}_{uuid.uuid4().hex[:8]}{ext}"
+    upload_dir = os.path.join(DATA_DIR, "uploads")
+    os.makedirs(upload_dir, exist_ok=True)
+    filepath = os.path.join(upload_dir, filename)
+    file.save(filepath)
+    return jsonify({"ok": True, "url": f"/uploads/{filename}", "filename": filename})
 
-// ══════════════════════════════════════════════
-// NUEVAS FUNCIONALIDADES
-// ══════════════════════════════════════════════
+@app.route("/uploads/<path:filename>")
+def serve_upload(filename):
+    import re
+    if re.search(r'[^a-zA-Z0-9._-]', filename):
+        abort(400)
+    upload_dir = os.path.join(DATA_DIR, "uploads")
+    return send_file(os.path.join(upload_dir, filename))
 
-// ── SEVERIDAD ─────────────────────────────────
-let _severidad = 'info';
-const SEV_COLORS = {
-  info: {color:'#38BDF8', label:'ℹ️ Info',      bg:'rgba(56,189,248,.12)'},
-  prec: {color:'#F59E0B', label:'⚠️ Precaución', bg:'rgba(245,158,11,.12)'},
-  crit: {color:'#EF4444', label:'🔴 Crítico',    bg:'rgba(239,68,68,.12)'},
-};
-function setSeveridad(sev) {
-  _severidad = sev;
-  ['info','prec','crit'].forEach(s => {
-    const btn = document.getElementById('sev-' + s);
-    if (btn) btn.classList.toggle('active', s === sev);
-  });
-  const ta = document.getElementById('f-novedad-input');
-  if (ta) ta.style.borderColor = SEV_COLORS[sev].color;
-}
+@app.route("/api/turnos", methods=["GET"])
+def get_turnos():
+    return jsonify(load_turnos())
 
-// ── ADJUNTOS ──────────────────────────────────
-const _attachments = {};
-function addAttach(context, input) {
-  if (!_attachments[context]) _attachments[context] = [];
-  Array.from(input.files).forEach(f => _attachments[context].push(f));
-  renderAttachList(context);
-  input.value = '';
-}
-function removeAttach(context, idx) {
-  if (_attachments[context]) _attachments[context].splice(idx, 1);
-  renderAttachList(context);
-}
-function renderAttachList(context) {
-  const list = document.getElementById('attach-list-' + context);
-  if (!list) return;
-  const files = _attachments[context] || [];
-  list.innerHTML = files.map((f, i) => {
-    const icon = f.type.startsWith('image/') ? '🖼️' : '📄';
-    const name = f.name.length > 18 ? f.name.slice(0,15)+'…' : f.name;
-    return `<div class="attach-item">${icon} ${name}
-      <button onclick="removeAttach('${context}',${i})">✕</button></div>`;
-  }).join('');
-}
-function getAttachNames(ctx) {
-  return (_attachments[ctx]||[]).map(f=>f.name);
-}
+@app.route("/api/turnos/<int:tid>", methods=["DELETE"])
+def delete_turno(tid):
+    data = [t for t in load_turnos() if t.get("id")!=tid]
+    save_turnos(data)
+    socketio.emit("turno_eliminado",{"id":tid})
+    return jsonify({"ok":True})
 
-// ── BADGE EN PESTAÑAS ─────────────────────────
-function showTabBadge(sec) {
-  if (sec === activeSec) return;
-  const b = document.getElementById('tnb-' + sec);
-  if (b) b.classList.add('show');
-}
-function clearTabBadge(sec) {
-  const b = document.getElementById('tnb-' + sec);
-  if (b) b.classList.remove('show');
-}
+@app.route("/api/pdf/<int:tid>")
+def get_pdf(tid):
+    t = next((x for x in load_turnos() if x.get("id")==tid),None)
+    if not t: abort(404)
+    buf = generar_pdf(t)
+    return send_file(buf, mimetype="application/pdf", as_attachment=True,
+                     download_name=f"Turno_{t.get('fecha','').replace('/','_')}_{t.get('turno','')}.pdf")
 
-// Override switchSector to clear badge
-const _origSwitch = switchSector;
-switchSector = function(sec) { _origSwitch(sec); clearTabBadge(sec); };
+@app.route("/api/email/<int:tid>", methods=["POST"])
+def send_email_route(tid):
+    t = next((x for x in load_turnos() if x.get("id")==tid),None)
+    if not t: return jsonify({"ok":False,"msg":"No encontrado"}),404
+    dest = (request.get_json() or {}).get("destino",CORREO_DEST)
+    if not SMTP_USER or not SMTP_PASS:
+        return jsonify({"ok":False,"msg":"SMTP no configurado","pdf_url":f"/api/pdf/{tid}"})
+    try:
+        buf = generar_pdf(t); enviar_correo(t,buf,dest)
+        return jsonify({"ok":True,"msg":f"Enviado a {dest}"})
+    except Exception as e:
+        return jsonify({"ok":False,"msg":str(e)}),500
 
-// ── FILTRO NOVEDADES ──────────────────────────
-function filtrarNovLog(q) {
-  q = q.toLowerCase().trim();
-  document.querySelectorAll('#novLogList > div').forEach(el => {
-    el.style.display = (!q || el.textContent.toLowerCase().includes(q)) ? '' : 'none';
-  });
-}
+@app.route("/api/status")
+def status():
+    try: ip = socket_lib.gethostbyname(socket_lib.gethostname())
+    except: ip = "cloud"
+    live = load_live()
+    return jsonify({"ok":True,"ip":ip,"total":len(load_turnos()),
+                    "turno_activo": bool(live),
+                    "time":datetime.now().strftime("%d/%m/%Y %H:%M:%S")})
 
-// ── NOVEDAD CON SEVERIDAD + ADJUNTOS ─────────
-// Reemplaza publicarNovedad completamente
-function _publicarNovedad_v2() {
-  const input  = document.getElementById('f-novedad-input');
-  const txt    = (input ? input.value : '').trim();
-  const autor  = (document.getElementById('f-entrega')||{value:''}).value.trim() || 'Sin nombre';
-  const sector = (document.getElementById('f-sector')||{value:''}).value.trim() || activeSec || '';
-  if (!txt) { showToast('Escribe una novedad primero','error'); return; }
-  if (input) input.value = '';
-  const sev      = _severidad;
-  const sevInfo  = SEV_COLORS[sev];
-  const adjuntos = getAttachNames('nov');
-  _attachments['nov'] = [];
-  renderAttachList('nov');
-  setSeveridad('info'); // reset
-  const entrada = {
-    texto:txt, autor:autor, sector:sector, severidad:sev,
-    adjuntos:adjuntos,
-    hora: new Date().toLocaleTimeString('es-CL',{hour:'2-digit',minute:'2-digit'}),
-    id: Date.now()
-  };
-  _renderNovEntry(entrada);
-  const panel = document.getElementById('novLogPanel');
-  const arrow = document.getElementById('novLogArrow');
-  if (panel) panel.style.display = 'block';
-  if (arrow) arrow.textContent = '▲';
-  showToast('📢 ' + sevInfo.label + ' publicado','success');
-  fetch('/api/novedad',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({texto:txt,autor:autor,sector:sector,severidad:sev,adjuntos:adjuntos})
-  }).catch(()=>{});
-}
+@app.route("/")
+def index():
+    from flask import render_template
+    return render_template("index.html")
 
-// Render una entrada de novedad con severidad y sector
-function _renderNovEntry(entrada) {
-  const el  = document.getElementById('novLogList');
-  const cnt = document.getElementById('novLogCount');
-  if (!el) return;
-  const ph = el.querySelector('[style*="font-style:italic"]');
-  if (ph) el.innerHTML = '';
-  if (document.querySelector(`#novLogList [data-id="${entrada.id}"]`)) return;
-  const secColor = {Limache:'#22C55E',Belloto:'#38BDF8',Puerto:'#F87171'};
-  const sev     = entrada.severidad || 'info';
-  const sevInfo = SEV_COLORS[sev] || SEV_COLORS.info;
-  const sc      = secColor[entrada.sector] || 'var(--cyan)';
-  const sb      = entrada.sector
-    ? `<span style="font-size:10px;background:${sc}22;color:${sc};padding:2px 8px;border-radius:10px;font-family:'IBM Plex Mono',monospace;font-weight:600;">${entrada.sector}</span>` : '';
-  const sevBadge = `<span style="font-size:10px;background:${sevInfo.bg};color:${sevInfo.color};padding:2px 8px;border-radius:10px;font-family:'IBM Plex Mono',monospace;font-weight:600;">${sevInfo.label}</span>`;
-  const adjHTML  = (entrada.adjuntos||[]).length
-    ? `<div style="margin-top:4px;display:flex;flex-wrap:wrap;gap:4px;">${(entrada.adjuntos).map(f=>`<span style="font-size:10px;background:var(--bg3);border:1px solid var(--border2);border-radius:5px;padding:2px 7px;">📎 ${f}</span>`).join('')}</div>` : '';
-  const div = document.createElement('div');
-  div.style.cssText = `background:${sevInfo.bg};border:1px solid ${sevInfo.color}44;border-radius:7px;padding:9px 12px;`;
-  div.dataset.id = entrada.id || Date.now();
-  div.innerHTML = `
-    <div style="display:flex;align-items:center;gap:6px;margin-bottom:5px;flex-wrap:wrap;">
-      <span style="font-size:11px;font-weight:600;color:var(--cyan);">${entrada.autor||'—'}</span>
-      ${sb} ${sevBadge}
-      <span style="font-size:10px;color:var(--muted2);font-family:'IBM Plex Mono',monospace;margin-left:auto;">${entrada.hora||''}</span>
-      <button onclick="eliminarNovedad(this)" style="background:none;border:none;cursor:pointer;color:var(--muted2);font-size:14px;line-height:1;padding:0 3px;" onmouseover="this.style.color='#EF4444'" onmouseout="this.style.color='var(--muted2)'">✕</button>
-    </div>
-    <div style="font-size:13px;color:var(--text);line-height:1.5;white-space:pre-wrap;">${entrada.texto||''}</div>
-    ${adjHTML}`;
-  el.insertBefore(div, el.firstChild);
-  if (cnt) cnt.textContent = el.children.length;
-}
+@app.route("/logo.png")
+def logo():
+    return send_file(LOGO_FILE, mimetype="image/png")
 
-// Override publicarNovedad y agregarNovLogLocal con versiones limpias
-publicarNovedad = _publicarNovedad_v2;
-agregarNovLogLocal = _renderNovEntry;
+@socketio.on("connect")
+def on_connect():
+    emit("sync_turnos", load_turnos())
+    emit("live_update",  load_live())
 
-// ── SOCKET para obs y fallas con badge ────────
-socket.off('obs_nueva');
-socket.on('obs_nueva', e => {
-  if(!e) return;
-  addLogEntry('obs-log-list-'+e.sector+'-'+e.tipo, 'cnt-'+e.sector+'-'+e.tipo, e);
-  showTabBadge(e.sector);
-  const panel = document.getElementById('obs-log-'+e.sector+'-'+e.tipo);
-  if(panel) panel.style.display='block';
-  const arr = document.getElementById('arr-'+e.sector+'-'+e.tipo);
-  if(arr) arr.textContent='▲';
-  showToast('📢 '+e.sector+': obs de '+(e.autor||'alguien'),'info');
-});
-socket.off('falla_nueva');
-socket.on('falla_nueva', e => {
-  if(!e) return;
-  renderFallaLogEntry(e.sector, e);
-  showTabBadge(e.sector);
-  const panel = document.getElementById('fallas-log-'+e.sector);
-  if(panel) panel.style.display='block';
-  const arr = document.getElementById('arr-fallas-'+e.sector);
-  if(arr) arr.textContent='▲';
-  showToast('🚨 '+e.sector+': falla de '+(e.autor||'alguien'),'warning');
-});
-socket.off('novedad_nueva');
-socket.on('novedad_nueva', e => {
-  if(!e) return;
-  if(document.querySelector('#novLogList [data-id="'+e.id+'"]')) return;
-  _renderNovEntry(e);
-  showToast('📢 '+(e.sector?'['+e.sector+'] ':' ')+(e.autor||''),'info');
-});
+# ── PDF ──────────────────────────────────────
+def generar_pdf(t):
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+                            leftMargin=1.8*cm, rightMargin=1.8*cm,
+                            topMargin=1.2*cm, bottomMargin=1.8*cm)
+    W = A4[0]-3.6*cm
+    story = []
+    def sty(n,**k): return ParagraphStyle(n,**k)
 
-// ── CLIMA en pushLive ──────────────────────────
-const _basePushLive = pushLive;
-pushLive = async function() {
-  // patch clima into the payload before sending
-  const climaEl = document.getElementById('f-clima');
-  if(climaEl && climaEl.value) {
-    // override will be captured by fetch in pushLive via f-clima field
-  }
-  return _basePushLive();
-};
+    logo_img = RLImage(LOGO_FILE,width=3.5*cm,height=3.0*cm) if os.path.exists(LOGO_FILE) else Paragraph("EFE",sty("l",fontName="Helvetica-Bold",fontSize=24,textColor=EFE_AZUL))
 
-// ── UPLOAD fotos a /data (Railway Volume) ──────
-async function subirFoto(file, context) {
-  const formData = new FormData();
-  formData.append('file', file);
-  formData.append('context', context);
-  try {
-    const r = await fetch('/api/upload', {method:'POST', body: formData});
-    const d = await r.json();
-    return d.ok ? d.url : null;
-  } catch(e) { return null; }
-}
+    tipo_cierre = t.get("tipo_cierre","parcial")
+    badge_cierre = "CIERRE PARCIAL" if tipo_cierre=="parcial" else "CIERRE TOTAL DEL DÍA"
+    badge_col = colors.HexColor("#F59E0B") if tipo_cierre=="parcial" else EFE_AZUL
 
-// Init
-setSeveridad('info');
+    sector_txt = t.get('sector','')
+    sector_txt  = t.get('sector','')
+    clima_txt   = t.get('clima','')
+    sector_line = f"Sector: {sector_txt}   " if sector_txt else ""
+    clima_line  = f"Clima: {clima_txt}   " if clima_txt else ""
+    hdr_right = [
+        Paragraph("EFE VALPARAÍSO", sty("t",fontName="Helvetica-Bold",fontSize=13,textColor=EFE_AZUL,alignment=TA_CENTER)),
+        Spacer(1,3),
+        Paragraph("Inspectores de Línea — Entrega de Turno", sty("s",fontName="Helvetica",fontSize=9,textColor=EFE_MUTED,alignment=TA_CENTER)),
+        Spacer(1,4),
+        Paragraph(f"{t.get('turno','')}  ·  {badge_cierre}", sty("tr",fontName="Helvetica-Bold",fontSize=10,textColor=badge_col,alignment=TA_CENTER)),
+        Spacer(1,3),
+        Paragraph(f"{sector_line}{clima_line}Fecha: {t.get('fecha','')}   Cierre: {t.get('hora_cierre','')}   Cerrado por: {t.get('cerrado_por','')}", sty("d",fontName="Helvetica",fontSize=8,textColor=EFE_MUTED,alignment=TA_CENTER)),
+    ]
+    hdr = Table([[logo_img,hdr_right]],colWidths=[3.8*cm,W-3.8*cm])
+    hdr.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'MIDDLE'),('LEFTPADDING',(0,0),(-1,-1),6)]))
+    story += [hdr, Spacer(1,0.3*cm),
+              HRFlowable(width=W,thickness=3,color=EFE_AZUL),
+              HRFlowable(width=W,thickness=2,color=EFE_ROJO,spaceAfter=6)]
+
+    def tbl_h(txt,col=EFE_AZUL):
+        tb = Table([[Paragraph(f"  {txt}",sty(f"h{txt[:5]}",fontName="Helvetica-Bold",fontSize=9,textColor=WHITE))]],colWidths=[W])
+        tb.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,-1),col),('TOPPADDING',(0,0),(-1,-1),5),('BOTTOMPADDING',(0,0),(-1,-1),5)]))
+        return tb
+
+    story.append(tbl_h("DATOS DEL TURNO"))
+    story.append(Spacer(1,2))
+    # Tabla datos turno - 2 filas
+    dt1 = Table([[
+        Paragraph("Quien entrega:",sty("fl0",fontName="Helvetica-Bold",fontSize=8,textColor=EFE_AZUL)),
+        Paragraph(t.get("entrega","—"),sty("fv0",fontName="Helvetica",fontSize=9,textColor=EFE_NEGRO)),
+        Paragraph("Quien recibe:",sty("fl0b",fontName="Helvetica-Bold",fontSize=8,textColor=EFE_AZUL)),
+        Paragraph(t.get("recibe","—") or "—",sty("fv0b",fontName="Helvetica",fontSize=9,textColor=EFE_NEGRO)),
+    ]],colWidths=[2.8*cm,W/2-2.8*cm,2.8*cm,W/2-2.8*cm])
+    dt1.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,-1),EFE_GRIS),('VALIGN',(0,0),(-1,-1),'TOP'),('TOPPADDING',(0,0),(-1,-1),4),('BOTTOMPADDING',(0,0),(-1,-1),4),('LEFTPADDING',(0,0),(-1,-1),8)]))
+
+    sector_val = t.get("sector","—") or "—"
+    dt2 = Table([[
+        Paragraph("Sector:",sty("fl1",fontName="Helvetica-Bold",fontSize=8,textColor=EFE_AZUL)),
+        Paragraph(sector_val,sty("fv1",fontName="Helvetica",fontSize=9,textColor=EFE_NEGRO)),
+        Paragraph("Novedades:",sty("fl2",fontName="Helvetica-Bold",fontSize=8,textColor=EFE_AZUL)),
+        Paragraph(t.get("novedades","—") or "—",sty("fv2",fontName="Helvetica",fontSize=9,textColor=EFE_NEGRO,leading=11)),
+    ]],colWidths=[2.8*cm,W/2-2.8*cm,2.8*cm,W/2-2.8*cm])
+    dt2.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,-1),EFE_GRIS),('VALIGN',(0,0),(-1,-1),'TOP'),('TOPPADDING',(0,0),(-1,-1),4),('BOTTOMPADDING',(0,0),(-1,-1),4),('LEFTPADDING',(0,0),(-1,-1),8)]))
+    story += [dt1, Spacer(1,1), dt2, Spacer(1,0.4*cm)]
+
+    # Novedades del día log
+    nov_log = t.get("novedades_log", [])
+    if nov_log:
+        story.append(tbl_h("NOVEDADES DEL DÍA"))
+        story.append(Spacer(1,3))
+        sec_colors_hex = {"Limache": colors.HexColor("#1D9E75"),
+                          "Belloto": colors.HexColor("#1A5FBB"),
+                          "Puerto":  colors.HexColor("#C8102E")}
+        for i, nov in enumerate(nov_log):
+            sec_n  = nov.get("sector","")
+            sc     = sec_colors_hex.get(sec_n, EFE_AZUL)
+            sec_badge = f" [{sec_n}]" if sec_n else ""
+            cab_s  = sty(f"nc{i}", fontName="Helvetica-Bold", fontSize=7,
+                         textColor=sc)
+            txt_s  = sty(f"nt{i}", fontName="Helvetica", fontSize=8,
+                         textColor=EFE_NEGRO, leading=11)
+            hora   = nov.get("hora","")
+            autor  = nov.get("autor","—")
+            texto  = nov.get("texto","")
+            nr = Table([[
+                Paragraph(f"{autor}{sec_badge}  {hora}", cab_s),
+                Paragraph(texto, txt_s)
+            ]], colWidths=[4*cm, W-4*cm])
+            nr.setStyle(TableStyle([
+                ('BACKGROUND',(0,0),(-1,-1), EFE_GRIS if i%2==0 else WHITE),
+                ('TOPPADDING',(0,0),(-1,-1),3),
+                ('BOTTOMPADDING',(0,0),(-1,-1),3),
+                ('LEFTPADDING',(0,0),(0,-1),8),
+                ('LEFTPADDING',(1,0),(1,-1),6),
+                ('VALIGN',(0,0),(-1,-1),'TOP'),
+                ('LINEBELOW',(0,0),(-1,-1),0.3,EFE_GRIS2),
+            ]))
+            story.append(nr)
+        story.append(Spacer(1,0.3*cm))
+
+    story.append(tbl_h("SECTORES"))
+    story.append(Spacer(1,4))
+
+    for sec in SECTORES:
+        sd = t.get("sectores",{}).get(sec,{})
+        col = SEC_COL.get(sec,EFE_AZUL)
+        nf = len(sd.get("trenesFalla",[]))
+        insp = sd.get("inspector","")
+        badge = f"  ⚠ {nf} en falla" if nf else "  ✔ Sin fallas"
+        sh = Table([[
+            Paragraph(f"  {sec.upper()}{('  ·  '+insp) if insp else ''}",sty(f"sh{sec}",fontName="Helvetica-Bold",fontSize=9,textColor=WHITE)),
+            Paragraph(badge,sty(f"sb{sec}",fontName="Helvetica-Bold",fontSize=8,textColor=WHITE if nf else colors.HexColor("#AAFFCC")))
+        ]],colWidths=[W*0.6,W*0.4])
+        sh.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,-1),col),('TOPPADDING',(0,0),(-1,-1),4),('BOTTOMPADDING',(0,0),(-1,-1),4),('LEFTPADDING',(0,0),(0,-1),8),('ALIGN',(1,0),(1,0),'RIGHT'),('RIGHTPADDING',(1,0),(1,0),8)]))
+        story.append(sh)
+        for tren in sd.get("trenesFalla",[]):
+            tr = Table([[Paragraph(f"🚨 {tren.get('tid','—')}  |  Tipo: {tren.get('tipo','')}  |  Andén: {tren.get('anden','')}",sty(f"tr{sec}",fontName="Helvetica-Bold",fontSize=8,textColor=EFE_ROJO))]],colWidths=[W])
+            tr.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,-1),colors.HexColor("#FEF0F0")),('TOPPADDING',(0,0),(-1,-1),3),('BOTTOMPADDING',(0,0),(-1,-1),3),('LEFTPADDING',(0,0),(-1,-1),12),('BOX',(0,0),(-1,-1),0.5,EFE_ROJO)]))
+            story.append(tr)
+            if tren.get("obs"):
+                ob = Table([[Paragraph(f"   Obs: {tren['obs']}",sty(f"to{sec}",fontName="Helvetica",fontSize=8,textColor=EFE_NEGRO,leading=11))]],colWidths=[W])
+                ob.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,-1),colors.HexColor("#FFF8F8")),('TOPPADDING',(0,0),(-1,-1),2),('BOTTOMPADDING',(0,0),(-1,-1),3),('LEFTPADDING',(0,0),(-1,-1),12)]))
+                story.append(ob)
+        lbl_s = sty(f"obsLbl{sec}",fontName="Helvetica-Bold",fontSize=8,textColor=EFE_AZUL)
+        val_s = sty(f"obsVal{sec}",fontName="Helvetica",fontSize=9,textColor=EFE_NEGRO,leading=13)
+        val_empty = sty(f"obsEmp{sec}",fontName="Helvetica",fontSize=9,textColor=EFE_MUTED,leading=13)
+
+        def obs_row(lbl, val):
+            v_sty = val_s if val and val.strip() else val_empty
+            v_txt = val if val and val.strip() else "Sin observaciones"
+            r = Table([[Paragraph(lbl, lbl_s), Paragraph(v_txt, v_sty)]],
+                      colWidths=[3.5*cm, W-3.5*cm])
+            r.setStyle(TableStyle([
+                ('BACKGROUND',(0,0),(-1,-1),EFE_GRIS),
+                ('TOPPADDING',(0,0),(-1,-1),5),('BOTTOMPADDING',(0,0),(-1,-1),5),
+                ('LEFTPADDING',(0,0),(0,-1),10),('LEFTPADDING',(1,0),(1,-1),8),
+                ('VALIGN',(0,0),(-1,-1),'TOP'),
+                ('LINEBELOW',(0,0),(-1,-1),0.5,EFE_GRIS2),
+            ]))
+            return r
+
+        story.append(obs_row("Infraestructura:", sd.get("infra","")))
+        story.append(Spacer(1,1))
+        story.append(obs_row("Personal / Operaciones:", sd.get("ops","")))
+        story.append(Spacer(1,1))
+        story.append(obs_row("Pendientes siguiente turno:", sd.get("pend","")))
+        story.append(Spacer(1,0.35*cm))
+
+    story += [
+        HRFlowable(width=W,thickness=1.5,color=EFE_AZUL,spaceBefore=4),
+        HRFlowable(width=W,thickness=1,color=EFE_ROJO,spaceAfter=4),
+        Paragraph(f"EFE Metro Valparaíso  |  {badge_cierre}  |  {datetime.now().strftime('%d/%m/%Y %H:%M')}",
+                  sty("pie",fontName="Helvetica",fontSize=7,textColor=EFE_MUTED,alignment=TA_CENTER))
+    ]
+    doc.build(story)
+    buf.seek(0)
+    return buf
+
+def enviar_correo(t,pdf_buf,destino):
+    msg = MIMEMultipart()
+    msg["From"] = SMTP_USER; msg["To"] = destino
+    tipo = "CIERRE PARCIAL" if t.get("tipo_cierre")=="parcial" else "CIERRE TOTAL"
+    msg["Subject"] = f"EFE Turnos — {tipo} — {t.get('turno','')} — {t.get('fecha','')}"
+    msg.attach(MIMEText(f"EFE Metro Valparaíso\n{tipo}\n\nTurno: {t.get('turno','')}\nFecha: {t.get('fecha','')}\nCerrado por: {t.get('cerrado_por','')}\nHora: {t.get('hora_cierre','')}\n\nSe adjunta el PDF.", "plain","utf-8"))
+    part = MIMEBase("application","octet-stream")
+    part.set_payload(pdf_buf.read()); encoders.encode_base64(part)
+    part.add_header("Content-Disposition",f'attachment; filename="Turno_{t.get("fecha","").replace("/","_")}.pdf"')
+    msg.attach(part)
+    with smtplib.SMTP(SMTP_HOST,SMTP_PORT) as srv:
+        srv.starttls(); srv.login(SMTP_USER,SMTP_PASS)
+        srv.sendmail(msg["From"],[destino],msg.as_string())
+
+if __name__ == "__main__":
+    try: ip = socket_lib.gethostbyname(socket_lib.gethostname())
+    except: ip = "127.0.0.1"
+    print(f"\n  EFE TURNOS v4  →  http://localhost:{PORT}  |  http://{ip}:{PORT}\n")
+    socketio.run(app, host="0.0.0.0", port=PORT, debug=False)
