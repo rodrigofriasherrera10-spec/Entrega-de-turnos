@@ -1,0 +1,7 @@
+flask
+flask-socketio
+reportlab
+pillow
+gunicorn
+gevent
+gevent-websocket
